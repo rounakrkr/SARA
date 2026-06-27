@@ -1,0 +1,61 @@
+# ── Python ───────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# ── Virtual environment ───────────────────────────────────────────────────────
+venv/
+env/
+.venv/
+
+# ── Secrets / Keys ───────────────────────────────────────────────────────────
+# NEVER commit real API keys. Copy .env.example → .env and fill in your keys.
+.env
+*.env
+keys/
+
+# ── Personal memory data ──────────────────────────────────────────────────────
+# ChromaDB stores per-user long-term memories — local only, never shared.
+data/chroma/
+# Legacy lore book (migrated automatically to data/lore/ on first run)
+data/lore_book.json
+
+# ── Live2D Models ─────────────────────────────────────────────────────────────
+# Large binary files (~100 MB+) with their own licenses.
+# Download separately and place in Models/ — see README for links.
+Models/
+static/models/
+# Paimon model (miHoYo copyright — not redistributable)
+static/paimon/
+
+# ── VAD (Voice Activity Detection) WASM assets ───────────────────────────────
+# ~20 MB binary files — downloaded automatically by download_vad_assets.py
+# after first setup. See README for instructions.
+static/vad/
+
+# ── Logs ─────────────────────────────────────────────────────────────────────
+*.log
+logs/
+
+# ── Test / scratch files ──────────────────────────────────────────────────────
+smoke_test.py
+smoke_test_extra.py
+view_lore.py
+input/
+output/
+
+# ── IDE / OS ──────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+.agents/
+.clinedoc
+.roocode
+*.DS_Store
+Thumbs.db

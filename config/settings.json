@@ -1,0 +1,19 @@
+{
+  "assistant": {
+    "name": "SARA",
+    "user_name": "User"
+  },
+  "interface": {
+    "prompt": "You: "
+  },
+  "logging": {
+    "level": "INFO"
+  },
+  "services": {
+    "openrouter_api_key": "",
+    "groq_api_key": "",
+    "elevenlabs_api_key": "",
+    "default_llm_engine": "openrouter",
+    "default_tts_engine": "mock"
+  }
+}

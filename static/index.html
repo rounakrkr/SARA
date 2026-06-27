@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SARA – Your Companion</title>
+    <meta name="description" content="SARA – a warm, genuine AI companion that listens, remembers, and grows with you.">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="stylesheet" href="/static/style.css?v=18">
+
+    <!-- Live2D + PIXI -->
+    <script src="https://cubism.live2d.com/sdk-web/cubismcore/live2dcubismcore.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/pixi.js@6.5.2/dist/browser/pixi.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/pixi-live2d-display@0.4.0/dist/cubism4.min.js"></script>
+
+    <!--
+        ONNX Runtime + Silero VAD (for neural voice activity detection).
+        Must load BEFORE app.js so the `vad` global is ready.
+        ort.js provides the WASM-based ONNX inference engine;
+        bundle.min.js wraps Silero into the vad.MicVAD API used in app.js.
+
+        Version pin: vad-web@0.0.22 + onnxruntime-web@1.14.0
+          0.0.22 is the last version WITHOUT the proxy-worker architecture.
+          It runs ORT directly in the main thread (no blob workers, no .mjs
+          ES module workers, no about:blank base-URL issues).  With numThreads=1
+          it uses ort-wasm-simd.wasm via a plain same-origin fetch — clean.
+    -->
+    <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.14.0/dist/ort.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.22/dist/bundle.min.js"></script>
+</head>
+<body>
+    <div id="app-container">
+
+        <!-- ── Left: Live2D Avatar ──────────────────────────────────────── -->
+        <div id="live2d-container">
+            <canvas id="canvas"></canvas>
+            <button id="toggle-chat-btn" title="Toggle UI Panel">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none"
+                     stroke="currentColor" stroke-width="2.5"
+                     stroke-linecap="round" stroke-linejoin="round">
+                    <polyline points="15 18 9 12 15 6"></polyline>
+                </svg>
+            </button>
+        </div>
+
+        <!-- ── Right: Chat Panel ───────────────────────────────────────── -->
+        <div id="chat-container">
+
+            <!-- Controls / Settings -->
+            <div id="controls">
+
+                <!-- SARA Identity + Bond Level -->
+                <div id="sara-header">
+                    <div id="sara-identity">
+                        <span class="online-pulse"></span>
+                        <span id="sara-display-name">SARA</span>
+                    </div>
+                    <div id="bond-display">
+                        <span class="bond-label">Bond</span>
+                        <div id="bond-track">
+                            <div id="bond-fill" style="width:0%"></div>
+                        </div>
+                        <span id="bond-value">–</span>
+                    </div>
+                </div>
+
+                <!-- Avatar Model -->
+                <div class="control-group">
+                    <label for="waifu-select">Avatar</label>
+                    <select id="waifu-select">
+                        <option value="/models/Design_genius_White/Design_genius_White/Design_genius_White/Design_genius(1).model3.json">Design Genius</option>
+                        <option value="/models/_Free__Snow_Leopard/%23Free%23%20Snow%20Leopard/Snow%20Leopard.model3.json">Snow Leopard</option>
+                        <option value="/models/hoshinonya_vts/hoshinonya_vts/hoshinonya_skiyoshi.model3.json">Hoshinonya</option>
+                        <option value="/models/%E9%AD%94%E5%A5%B3/%E9%AD%94%E5%A5%B3/%E9%AD%94%E5%A5%B3.model3.json">Witch</option>
+                    </select>
+                </div>
+
+                <!-- AI Model — fastest/free first for voice latency -->
+                <div class="control-group">
+                    <label for="llm-select">AI Model</label>
+                    <select id="llm-select">
+                        <option value="groq-fast">⚡ Groq Llama 8B</option>
+                        <option value="groq">Groq Llama 70B</option>
+                        <option value="gemini">✨ Gemini Flash-Lite</option>
+                        <option value="dolphin">Dolphin (OpenRouter)</option>
+                        <option value="hermes">Hermes 3 (OpenRouter)</option>
+                    </select>
+                </div>
+
+                <!-- Mood Preset -->
+                <div class="control-group">
+                    <label for="mood-select">Mood</label>
+                    <select id="mood-select">
+                        <option value="warm">🌸 Warm &amp; Present</option>
+                        <option value="calm">🌊 Calm &amp; Grounding</option>
+                        <option value="playful">✨ Playful &amp; Light</option>
+                        <option value="empathetic">💙 Deeply Empathetic</option>
+                        <option value="wise">🌿 Thoughtful &amp; Wise</option>
+                        <option value="energetic">⚡ Uplifting</option>
+                    </select>
+                </div>
+
+                <!-- Toggle Row: TTS  +  Lore Memory -->
+                <div id="toggle-row">
+                    <!-- TTS Provider Toggle -->
+                    <div class="mini-toggle">
+                        <span class="mini-label">EdgeTTS</span>
+                        <label class="switch">
+                            <input type="checkbox" id="tts-toggle">
+                            <span class="slider"></span>
+                        </label>
+                        <span class="mini-label" style="color:var(--accent-glow-secondary)">ElevenLabs</span>
+                    </div>
+                </div>
+
+                <!-- Active Character — populated by JS after lore selection -->
+                <div id="active-character-section" style="display:none">
+                    <div class="active-char-card">
+                        <span id="active-char-emoji" class="active-char-emoji">🌧️</span>
+                        <div class="active-char-info">
+                            <div id="active-char-name" class="active-char-name">Sara</div>
+                            <div id="active-char-tagline" class="active-char-tagline">Street Beggar</div>
+                        </div>
+                        <button id="change-char-btn" class="change-char-btn" title="Switch character">⟳</button>
+                    </div>
+                </div>
+            </div><!-- /controls -->
+
+            <!-- Chat Messages -->
+            <div id="chat-history"></div>
+
+            <!-- Input Area -->
+            <div id="input-area">
+                <button id="mic-btn" title="Push to talk">🎙️</button>
+                <input type="text" id="chat-input" placeholder="Say something…" autocomplete="off">
+                <button id="send-btn">Send</button>
+            </div>
+
+            <!-- VAD Continuous Listening -->
+            <div id="vad-settings">
+                <span class="vad-label">Continuous Listening</span>
+                <label class="switch" style="transform:scale(0.8)">
+                    <input type="checkbox" id="vad-toggle">
+                    <span class="slider round"></span>
+                </label>
+                <div id="vad-status" title="VAD status"></div>
+            </div>
+
+        </div><!-- /chat-container -->
+    </div><!-- /app-container -->
+
+    <script src="/static/app.js?v=38"></script>
+
+    <!-- ── Lore Selection Screen ─────────────────────────────────────────── -->
+    <!-- Shown on connect; user must pick a character before chatting.         -->
+    <!-- Hidden (opacity:0 → pointer-events:none) after selection.            -->
+    <div id="lore-select-screen" class="lore-select-screen">
+        <div class="lore-select-bg"></div>
+        <div class="lore-select-panel">
+            <div class="lore-select-header">
+                <div class="lore-sara-wordmark">S&thinsp;A&thinsp;R&thinsp;A</div>
+                <h1 class="lore-select-title">Choose Your Story</h1>
+                <p class="lore-select-subtitle">Each character holds their own memories of you</p>
+            </div>
+            <div id="lore-cards-grid" class="lore-cards-grid">
+                <!-- character cards injected by JS -->
+            </div>
+            <div id="lore-loading-indicator" class="lore-loading">
+                <div class="lore-spinner"></div>
+                <span>Loading characters…</span>
+            </div>
+        </div>
+    </div>
+
+</body>
+</html>
