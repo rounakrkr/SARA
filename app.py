@@ -20,6 +20,7 @@ import edge_tts
 from core.pipeline import InteractionPipeline
 from core.brain import CoreBrain
 from core.personality import DEFAULT_MOOD
+from core.natural_conversation import get_conversation_engine, ThinkingLevel
 from memory.session import SessionMemory
 from memory.long_term import LongTermMemory, extract_memories_sync
 from memory.lore import LoreBook, LorePackManager
@@ -263,7 +264,33 @@ async def generate_tts(
     return b"", []
 
 
+async def classify_intent_enhanced(text: str, context_emotion: str = "neutral") -> ThinkingLevel:
+    """Enhanced intent classification using the Natural Conversation Engine.
+    
+    This provides more granular thinking levels than the old HMM/LET_ME_THINK system.
+    Falls back to simple classification if conversation engine is unavailable.
+    """
+    try:
+        conv_engine = get_conversation_engine(character_name="Sara")
+        thinking_level = conv_engine.classify_thinking_level(text)
+        return thinking_level
+    except Exception as e:
+        print(f"[Natural Conv] Classification error: {e}, using fallback")
+        # Fallback to basic classification
+        text_lower = text.lower()
+        if any(word in text_lower for word in ["why", "how", "explain", "complex"]):
+            return ThinkingLevel.THINKING
+        elif len(text.split()) > 10:
+            return ThinkingLevel.CONSIDERING
+        return ThinkingLevel.NONE
+
+
 async def classify_intent_groq(text: str) -> str:
+    """Legacy intent classifier - kept for compatibility.
+    
+    Note: This is being phased out in favor of classify_intent_enhanced()
+    which provides more granular thinking levels.
+    """
     api_key = os.getenv("GROQ_API_KEY", "")
     if not api_key:
         return "NONE"
@@ -274,6 +301,7 @@ Analyze the user's message and determine if the AI needs a 'thinking pause' befo
 - If it's a question requiring some thought or search (e.g. 'What is a black hole?', 'Write a poem'), output ONLY: HMM
 - If it's a highly complex, deep, or multi-step question (e.g. 'How do I build a nuclear reactor?', 'Explain quantum physics in detail'), output ONLY: LET_ME_THINK
 Output NO OTHER TEXT. ONLY the exact word."""
+
 
     payload = {
         "model": "llama-3.1-8b-instant",   # Updated: llama3-8b-8192 is deprecated
@@ -372,9 +400,12 @@ async def process_and_stream(
     else:
         enabled_packs = None   # None = all packs
 
-    intent_task = None
+    # Enhanced natural conversation: classify thinking level and play appropriate filler
+    thinking_level = ThinkingLevel.NONE
     if not is_continuation:
-        intent_task = asyncio.create_task(classify_intent_groq(msg))
+        # Use enhanced intent classification
+        thinking_level = await classify_intent_enhanced(msg, current_mood)
+        print(f"[Natural Conv] Thinking level: {thinking_level.value}")
 
     async with lock:
         response_task = asyncio.create_task(asyncio.to_thread(
@@ -383,19 +414,26 @@ async def process_and_stream(
             lore_en, enabled_packs
         ))
 
-        if intent_task:
-            intent = await intent_task
-            if intent in ["HMM", "LET_ME_THINK"]:
-                filename = "hmm.mp3" if intent == "HMM" else "let_me_think.mp3"
-                filepath = os.path.join("static", "audio", filename)
-                if os.path.exists(filepath):
-                    with open(filepath, "rb") as f:
-                        filler_audio = f.read()
-                    await broadcast_ws(sid, {
-                        "type": "audio",
-                        "content": base64.b64encode(filler_audio).decode("utf-8"),
-                        "is_filler": True
-                    })
+        # Play natural filler sound while waiting for LLM response
+        if thinking_level != ThinkingLevel.NONE:
+            try:
+                conv_engine = get_conversation_engine(character_name="Sara")
+                filler_result = conv_engine.select_filler(thinking_level, current_mood)
+
+                if filler_result:
+                    filepath, duration = filler_result
+                    if os.path.exists(filepath):
+                        with open(filepath, "rb") as f:
+                            filler_audio = f.read()
+                        await broadcast_ws(sid, {
+                            "type": "audio",
+                            "content": base64.b64encode(filler_audio).decode("utf-8"),
+                            "is_filler": True
+                        })
+                        print(f"[Natural Conv] Played filler: {os.path.basename(filepath)} ({duration:.2f}s)")
+            except Exception as e:
+                print(f"[Natural Conv] Filler playback error: {e}")
+
 
         response = await response_task
 
@@ -417,6 +455,17 @@ async def process_and_stream(
     # exchanges worth extracting facts from.
     if not is_continuation and response.text.strip():
         asyncio.create_task(_extract_and_store_memory(msg, response.text, ltm=session_ltm))
+
+    # Update conversation engine context for better flow tracking
+    try:
+        conv_engine = get_conversation_engine(character_name="Sara")
+        conv_engine.update_context(
+            emotion=response.emotion or "neutral",
+            turn_count=pipeline.memory.turn_count
+        )
+    except Exception as e:
+        print(f"[Natural Conv] Context update error: {e}")
+
 
     await broadcast_ws(sid, {
         "type": "metadata",
@@ -442,7 +491,41 @@ async def process_and_stream(
     # emotion — the LLM outputs one emotion per full reply, not per sentence.
     response_emotion = response.emotion or "neutral"
 
-    for sentence in split_into_sentences(tts_text):
+    # Get conversation engine for natural breathing
+    try:
+        conv_engine = get_conversation_engine(character_name="Sara")
+        last_was_emotional = conv_engine.context.last_topic_emotional
+    except Exception:
+        conv_engine = None
+        last_was_emotional = False
+
+    sentences = split_into_sentences(tts_text)
+    for idx, sentence in enumerate(sentences):
+        # Add natural breathing between sentences
+        if conv_engine and idx > 0:  # Not before first sentence
+            sentence_length = len(sentence.split())
+            should_breathe = conv_engine.should_add_breathing(
+                emotion=response_emotion,
+                sentence_length=sentence_length,
+                last_was_emotional=last_was_emotional
+            )
+            
+            if should_breathe:
+                breath_sound = conv_engine.get_breathing_sound(response_emotion)
+                if breath_sound and os.path.exists(breath_sound):
+                    try:
+                        with open(breath_sound, "rb") as f:
+                            breath_audio = f.read()
+                        await broadcast_ws(sid, {
+                            "type": "audio",
+                            "content": base64.b64encode(breath_audio).decode("utf-8"),
+                            "is_breathing": True
+                        })
+                        print(f"[Natural Conv] Added breath before sentence {idx + 1}")
+                    except Exception as e:
+                        print(f"[Natural Conv] Breath playback error: {e}")
+        
+        # Generate and send sentence audio
         audio_bytes, word_boundaries = await generate_tts(
             sentence, tts_prov, edge_vc, emotion=response_emotion
         )
@@ -457,8 +540,11 @@ async def process_and_stream(
                 "word_boundaries": word_boundaries,
             })
 
+    # Only schedule a continuation from a real user turn — never from a
+    # continuation itself. Chaining continuations causes an infinite loop
+    # where Sara keeps self-talking after a single user message.
     continue_time = getattr(response, 'continue_in_seconds', 0)
-    if isinstance(continue_time, (int, float)) and continue_time > 0:
+    if not is_continuation and isinstance(continue_time, (int, float)) and continue_time > 0:
         continue_time = max(1.5, min(continue_time, 6))
 
         async def schedule_continuation():

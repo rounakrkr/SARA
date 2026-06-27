@@ -142,7 +142,7 @@ ws.onmessage = async (event) => {
         updateBondDisplay(data.level);
         // Don't auto-fetch lore packs for toggles — selection screen handles that
     } else if (data.type === "audio") {
-        playAudio(data.content, data.word_boundaries || []);
+        playAudio(data.content, data.word_boundaries || [], !!(data.is_filler || data.is_breathing));
     } else if (data.type === "fallback_alert") {
         appendMessage("System", data.text);
         const sel = document.getElementById("llm-select");
@@ -204,28 +204,39 @@ function triggerEmotion(emotion, affectionDelta = 0) {
     const exprKey = EMOTION_TO_EXPR_KEY[emotion?.toLowerCase()] ?? null;
 
     // Compute intensity from affection_delta magnitude:
-    //   |delta| = 0 → 0.25  (subtle — emotion is present but mild)
-    //   |delta| = 1 → 0.50
-    //   |delta| = 2 → 0.75
+    //   |delta| = 0 → 0.70  (clearly visible baseline)
     //   |delta| = 3 → 1.00  (full — strong emotional moment)
+    // Minimum raised from 0.25 to 0.70 so expressions are always noticeable.
     const magnitude = Math.abs(affectionDelta || 0);
-    const intensity  = exprKey ? Math.min(1.0, 0.25 + (magnitude / 3) * 0.75) : 0;
+    const intensity  = exprKey ? Math.min(1.0, 0.70 + (magnitude / 3) * 0.30) : 0;
 
     try {
         const core = model.internalModel?.coreModel;
         if (!core) return;
 
-        // Clear ALL expression params directly (bypasses expressionManager entirely —
-        // pixi-live2d-display v0.4.x's expressionManager is often null or races
-        // with its own async blend; direct coreModel writes are always safe because
-        // lip sync already uses the exact same path and works perfectly).
+        // Clear ALL expression params so the previous expression doesn't linger.
         for (const params of Object.values(DESIGN_GENIUS_EXPR_PARAMS)) {
             for (const { id } of params) {
                 core.setParameterValueById(id, 0);
             }
         }
 
-        // Register new expression for the ticker to sustain every frame.
+        // Use model.expression() for named expressions — this uses the built-in
+        // pixi-live2d-display expression manager which correctly blends using the
+        // .exp3.json files registered in model3.json. Falls back to direct write
+        // if the expression manager isn't available yet.
+        if (exprKey) {
+            try {
+                model.expression(exprKey);
+            } catch(e) {
+                // expressionManager not ready — fall back to direct coreModel write
+                activeExpressionOverride = { params: DESIGN_GENIUS_EXPR_PARAMS[exprKey] || [], intensity };
+                return;
+            }
+        }
+
+        // Register override so ticker sustains the intensity every frame.
+        // When neutral (exprKey null), override is cleared and coreModel stays at 0.
         activeExpressionOverride = (exprKey && intensity > 0)
             ? { params: DESIGN_GENIUS_EXPR_PARAMS[exprKey] || [], intensity }
             : null;
@@ -236,6 +247,7 @@ function triggerEmotion(emotion, affectionDelta = 0) {
 // ── Audio & Lip Sync ──────────────────────────────────────────────────────────
 let audioCtx, globalAudio, globalAnalyzer, globalDataArray;
 let audioQueue = [], isPlayingQueue = false;
+let currentIsFiller = false;  // true when a filler/breath sound is playing
 
 // Word boundaries for the currently-playing audio chunk.
 //
@@ -258,38 +270,11 @@ app.ticker.add(() => {
     if (!model) return;
 
     // ── Lip sync ────────────────────────────────────────────────────────────
-    let mouthValue = 0;
-
-    if (globalAudio && !globalAudio.paused && !globalAudio.ended) {
-        if (currentWordBoundaries.length > 0) {
-            // Word-boundary mode: check whether the current playback
-            // position (ms) falls inside any word's time window.
-            // audio.currentTime is in seconds — multiply by 1000 for ms.
-            // This stays accurate across stalls and tab-backgrounding
-            // because it's tied to the decoded audio clock, not wallclock.
-            const currentMs = globalAudio.currentTime * 1000;
-            const insideWord = currentWordBoundaries.some(
-                wb => currentMs >= wb.offset_ms && currentMs < (wb.offset_ms + wb.duration_ms)
-            );
-            // Mouth fully open during a word, cleanly closed between words.
-            // A fixed value of 0.85 (not 1.0) avoids the model's wide-open
-            // "maximum" pose, which looks unnatural during normal speech.
-            mouthValue = insideWord ? 0.85 : 0.0;
-        } else if (globalAnalyzer && globalDataArray) {
-            // Amplitude fallback for ElevenLabs (or any provider that
-            // doesn't supply per-word timing). Same formula as before.
-            globalAnalyzer.getByteFrequencyData(globalDataArray);
-            let sum = 0;
-            for (let i = 0; i < globalDataArray.length; i++) sum += globalDataArray[i];
-            mouthValue = Math.max(0, Math.min(1, Math.pow((sum / globalDataArray.length - 5) / 60, 1.5)));
-        }
-    }
-
-    // Design_genius_White uses "ParamMouthOpenY" (Cubism 4 naming);
-    // setting both the Cubism 4 and legacy Cubism 2 names covers any
-    // model that may be swapped in without needing a separate code path.
-    model.internalModel.coreModel.setParameterValueById('ParamMouthOpenY',   mouthValue);
-    model.internalModel.coreModel.setParameterValueById('PARAM_MOUTH_OPEN_Y', mouthValue);
+    // NOTE: Design_genius_White's LipSync group is empty (no mouth parameter
+    // assigned in model3.json). Writing ParamMouthOpenY / PARAM_MOUTH_OPEN_Y
+    // caused a "beak" deformation artifact because those IDs map to unexpected
+    // mesh parameters in this Cubism 4 model. Mouth animation is handled
+    // naturally by the idle motion bundled with the model.
 
     // ── Expression override (sustain per frame) ──────────────────────────────
     // triggerEmotion() cleared all params and stored the target in
@@ -328,8 +313,8 @@ app.ticker.add(() => {
 // Each item in audioQueue is now { audio: base64String, wordBoundaries: [] }
 // instead of a plain string. wordBoundaries drives precise mouth timing
 // in the ticker above when using Edge-TTS; empty list for ElevenLabs.
-async function playAudio(base64Data, wordBoundaries = []) {
-    audioQueue.push({ audio: base64Data, wordBoundaries });
+async function playAudio(base64Data, wordBoundaries = [], isFiller = false) {
+    audioQueue.push({ audio: base64Data, wordBoundaries, isFiller });
     processAudioQueue();
 }
 
@@ -337,7 +322,7 @@ async function processAudioQueue() {
     if (isPlayingQueue || audioQueue.length === 0) return;
     isPlayingQueue = true;
 
-    const { audio: base64Data, wordBoundaries } = audioQueue.shift();
+    const { audio: base64Data, wordBoundaries, isFiller: itemIsFiller } = audioQueue.shift();
 
     const bytes = Uint8Array.from(atob(base64Data), c => c.charCodeAt(0));
     const url = URL.createObjectURL(new Blob([bytes], { type: 'audio/mpeg' }));
@@ -345,10 +330,8 @@ async function processAudioQueue() {
     globalAudio = audio;
     audio.crossOrigin = "anonymous";
 
-    // Load the word boundaries for this sentence so the ticker can drive
-    // the mouth. Cleared in onended/on-error so the mouth closes cleanly
-    // between sentences and isn't left hanging open if playback fails.
     currentWordBoundaries = wordBoundaries || [];
+    currentIsFiller = !!itemIsFiller;
 
     if (model) {
         if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
@@ -366,17 +349,16 @@ async function processAudioQueue() {
     }
 
     audio.onended = () => {
-        // Clear boundaries so the mouth closes and isn't stuck open between
-        // sentences. The next sentence will set its own boundaries immediately.
         currentWordBoundaries = [];
+        currentIsFiller = false;
         isPlayingQueue = false;
         processAudioQueue();
     };
     try {
         await audio.play();
     } catch(e) {
-        // Playback failed (e.g. browser autoplay policy before first user gesture).
         currentWordBoundaries = [];
+        currentIsFiller = false;
         isPlayingQueue = false;
         processAudioQueue();
     }
@@ -765,27 +747,29 @@ micBtn.addEventListener('mouseleave', () => { if (mediaRecorder?.state === 'reco
 const vadToggle = document.getElementById('vad-toggle');
 const vadStatus  = document.getElementById('vad-status');
 
-// ── Configuration constants ───────────────────────────────────────────────────
+// ── Configuration constants ──────────────────────────────────────────────────
+// Values come from vad_config_enhanced.js (loaded before this script in HTML).
+// window.VAD_CONFIG is set by that file; the ?? fallbacks here are safety nets
+// so the VAD still works even if the config file fails to load for any reason.
 
-// Silero model output thresholds. The creators recommend setting
-// negativeSpeechThreshold ~0.15 below positiveSpeechThreshold.
-const VAD_POSITIVE_THRESHOLD = 0.50;   // above this → frame is speech
-const VAD_NEGATIVE_THRESHOLD = 0.35;   // below this → frame is silence
+const VAD_CFG = window.VAD_CONFIG ?? {};
 
-// While SARA's TTS audio is playing, require higher sustained confidence
-// before treating detected audio as genuine user speech (echo guard).
-// Genuine barge-in at normal speaking volume will still clear this.
-// Speaker leakage without headphones typically peaks at 0.55–0.65.
-const VAD_ECHO_GUARD_THRESHOLD = 0.72;
+// Silero model output thresholds.
+const VAD_POSITIVE_THRESHOLD  = VAD_CFG.positiveSpeechThreshold ?? 0.50;
+const VAD_NEGATIVE_THRESHOLD  = VAD_CFG.negativeSpeechThreshold ?? 0.35;
 
-// Rolling window of per-frame probabilities maintained during speech.
-// At ~60ms per Silero frame, 20 frames ≈ 1200ms of context for slope analysis.
-const VAD_PROB_HISTORY_LEN = 20;
+// Echo guard: higher threshold while SARA's TTS is playing.
+const VAD_ECHO_GUARD_THRESHOLD = VAD_CFG.echoGuardThreshold ?? 0.72;
 
-// Extra silence added in onSpeechEnd for a detected trail-off, on top of
-// vad-web's internal redemptionMs. Gives the user time to continue their
-// thought. If they do speak, trailOffPending is cancelled immediately.
-const VAD_TRAILOFF_EXTRA_MS = 1400;
+// Rolling window of per-frame probabilities for trail-off slope analysis.
+const VAD_PROB_HISTORY_LEN    = VAD_CFG.probHistoryLength   ?? 20;
+
+// Extra silence added on top of redemptionMs when a trail-off is detected.
+const VAD_TRAILOFF_EXTRA_MS   = VAD_CFG.trailoffExtraMs     ?? 1400;
+
+// Trail-off detection: slope boundaries (fraction of mid-window average).
+const VAD_TRAILOFF_MIN_DECLINE = VAD_CFG.trailoffMinDecline ?? 0.15;
+const VAD_TRAILOFF_MAX_DECLINE = VAD_CFG.trailoffMaxDecline ?? 0.70;
 
 // ── State ─────────────────────────────────────────────────────────────────────
 
@@ -836,10 +820,10 @@ function detectTrailOff() {
 
     const declineRatio = (midAvg - recentAvg) / midAvg;
 
-    // 15–70% gradual decline = trail-off.
-    // >70% = hard stop (sudden silence, not a trailing fade).
-    // <15% = still speaking strongly (no meaningful decline yet).
-    return declineRatio > 0.15 && declineRatio < 0.70;
+    // VAD_TRAILOFF_MIN_DECLINE–VAD_TRAILOFF_MAX_DECLINE gradual decline = trail-off.
+    // > max = hard stop (sudden silence, not a trailing fade).
+    // < min = still speaking strongly (no meaningful decline yet).
+    return declineRatio > VAD_TRAILOFF_MIN_DECLINE && declineRatio < VAD_TRAILOFF_MAX_DECLINE;
 }
 
 // ── WAV encoding ─────────────────────────────────────────────────────────────
@@ -996,27 +980,9 @@ async function startVAD() {
             negativeSpeechThreshold: VAD_NEGATIVE_THRESHOLD,
 
             // ── Timing ────────────────────────────────────────────────────────
-            //
-            // preSpeechPadMs — built-in pre-roll. Frames captured before
-            // onSpeechStart fires are prepended to the audio in onSpeechEnd.
-            // 600ms ensures the first word/syllable is never clipped even if
-            // the user begins speaking right as they trigger the confirm window.
-            // Replaces the old 500ms DelayNode + MediaStreamDestination trick.
-            preSpeechPadMs: 600,
-
-            // minSpeechMs — minimum sustained speech duration before the
-            // library considers speech valid and fires onSpeechStart.
-            // This IS the "confirm window" from the spec (150–250ms).
-            // Short sounds — coughs, chair creaks, brief mic bumps — that
-            // don't sustain for this long are discarded via onVADMisfire.
-            minSpeechMs: 200,
-
-            // redemptionMs — how long Silero must report silence continuously
-            // before speech is considered ended. This is the BASE silence
-            // timeout; an additional VAD_TRAILOFF_EXTRA_MS is added in
-            // onSpeechEnd when a trail-off is detected.
-            // 900ms ≈ a normal breath/pause between sentences.
-            redemptionMs: 900,
+            preSpeechPadMs: VAD_CFG.preSpeechPadMs ?? 600,
+            minSpeechMs:    VAD_CFG.minSpeechMs    ?? 200,
+            redemptionMs:   VAD_CFG.redemptionMs   ?? 900,
 
             // ── Custom mic stream with track-ended detection ──────────────────
             // Override getStream to intercept the mic track and attach a

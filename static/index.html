@@ -149,7 +149,9 @@
         </div><!-- /chat-container -->
     </div><!-- /app-container -->
 
-    <script src="/static/app.js?v=38"></script>
+    <!-- VAD config must load BEFORE app.js so window.VAD_CONFIG is ready -->
+    <script src="/static/vad_config_enhanced.js?v=2"></script>
+    <script src="/static/app.js?v=40"></script>
 
     <!-- ── Lore Selection Screen ─────────────────────────────────────────── -->
     <!-- Shown on connect; user must pick a character before chatting.         -->
